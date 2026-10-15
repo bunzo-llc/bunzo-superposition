@@ -2,8 +2,7 @@ name: Forecast on Metaculus Cup
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 0 */2 * *" # runs at midnight every 2 days
+  # No schedule: the Metaculus Cup is run by hand only.
 
 # Add concurrency group to prevent parallel runs
 concurrency:
