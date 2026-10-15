@@ -172,10 +172,10 @@ class FallTemplateBot2026(ForecastBot):
 
         prompt = clean_indents(
             f"""
-            You are an assistant to a superforecaster.
-            The superforecaster will give you a question they intend to forecast on.
-            To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
-            You do not produce forecasts yourself.
+            You are a research assistant to a superforecaster.
+            The superforecaster will forecast the question below. Your job is to find the current facts they need. You do not produce forecasts yourself.
+
+            Today is {datetime.now().strftime("%Y-%m-%d")}. Your own knowledge may be out of date, so use the web search tool to check the current state of things. You can search at most 3 times, so plan your searches: start with the most recent status of the exact thing the resolution criteria measure, then look for scheduled events or announcements before the resolution date, then (if useful) a base rate or historical comparison.
 
             Question:
             {question.question_text}
@@ -184,6 +184,13 @@ class FallTemplateBot2026(ForecastBot):
             {question.resolution_criteria}
 
             {question.fine_print}
+
+            Write a concise but detailed rundown in English:
+            - The latest relevant facts and news, each with its date and the source URL.
+            - Whether, based on current information, the question would resolve Yes or No (or where the value currently stands), and how close it is to the threshold in the resolution criteria.
+            - Scheduled events, deadlines or data releases between today and the resolution date that could change the outcome.
+            - Base rates or historical comparisons, if you found any.
+            Clearly separate what your searches found from anything you are recalling from memory, and say so when a search found nothing useful.
             """
         )
         return prompt
@@ -683,6 +690,69 @@ class FallTemplateBot2026(ForecastBot):
         )
 
 
+def make_anthropic_llms() -> dict[str, GeneralLlm]:
+    """
+    Every purpose is pinned to an Anthropic model so nothing falls back to the
+    forecasting-tools defaults (retired Claude 3.x models or the Metaculus proxy).
+
+    Claude Opus 5.5 and Claude Haiku 5.5 reject `temperature` and manual thinking
+    budgets, so temperature is left unset and `reasoning_effort` is not used
+    (litellm turns it into a budget). Both models think adaptively at effort
+    `medium` by default; to change that, pass `output_config={"effort": ...}`
+    (litellm then also sends an `effort-2025-11-24` beta header).
+    Thinking counts toward `max_tokens`, so each cap leaves room for it.
+    """
+    return {
+        "default": GeneralLlm(
+            model="anthropic/claude-opus-5-5",
+            max_tokens=16000,
+            timeout=300,
+            allowed_tries=2,
+        ),
+        "researcher": GeneralLlm(
+            model="anthropic/claude-haiku-5-5",
+            tools=[
+                {
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": 3,
+                }
+            ],
+            max_tokens=8000,
+            timeout=180,
+            allowed_tries=2,
+        ),
+        "parser": GeneralLlm(
+            model="anthropic/claude-haiku-5-5",
+            max_tokens=4000,
+            timeout=60,
+            allowed_tries=2,
+        ),
+        # Unused while enable_summarize_research=False; pinned so it can never
+        # fall back to a default model.
+        "summarizer": GeneralLlm(
+            model="anthropic/claude-haiku-5-5",
+            max_tokens=4000,
+            timeout=60,
+            allowed_tries=2,
+        ),
+    }
+
+
+def make_bot(publish_to_metaculus: bool) -> FallTemplateBot2026:
+    return FallTemplateBot2026(
+        research_reports_per_question=1,
+        predictions_per_research_report=3,
+        use_research_summary_to_forecast=False,
+        publish_reports_to_metaculus=publish_to_metaculus,
+        folder_to_save_reports_to=None,
+        skip_previously_forecasted_questions=True,
+        enable_summarize_research=False,
+        extra_metadata_in_explanation=False,
+        llms=make_anthropic_llms(),
+    )
+
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
@@ -704,29 +774,7 @@ if __name__ == "__main__":
     publish_to_metaculus = True
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # Configure the bot. The `llms=` block below is commented out to use
-    # whichever default models forecasting-tools picks based on your env vars;
-    # uncomment and edit to pin specific models.
-    template_bot = FallTemplateBot2026(
-        research_reports_per_question=1,
-        predictions_per_research_report=5,
-        use_research_summary_to_forecast=False,
-        publish_reports_to_metaculus=publish_to_metaculus,
-        folder_to_save_reports_to=None,
-        skip_previously_forecasted_questions=True,
-        extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
-    )
+    template_bot = make_bot(publish_to_metaculus)
 
     # Per-mode tournament URL shown in the summary banner footer. These
     # piggyback on the forecasting_tools SDK constants and need updating
