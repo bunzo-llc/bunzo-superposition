@@ -1,0 +1,30 @@
+name: Watch the tournament bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "53 22 * * *" # 22:53 UTC = 07:53 JST, every day
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+# Posts a daily report on the "見張りの日報" issue: last 24h of
+# run_bot_on_tournament.yaml runs, questions forecast, stalls, and whether the
+# scheduled workflows are still enabled. Uses only GITHUB_TOKEN.
+permissions:
+  contents: read # check out the script
+  actions: write # read runs and logs; re-enable a workflow disabled for inactivity
+  issues: write # create the report issue and comment on it
+
+jobs:
+  watch_job:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Write the daily report
+        run: python3 .github/scripts/watch_bot.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
