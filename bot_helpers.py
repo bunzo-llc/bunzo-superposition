@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 import warnings
+from dataclasses import dataclass
 from typing import Any, Sequence
 
 
@@ -146,4 +147,41 @@ def print_run_summary_banner(
             print(f"  ❌ {type(exc).__name__}: {msg}")
 
     print(banner)
+    print()
+
+
+@dataclass
+class FailedQuestion:
+    """
+    One question whose forecast raised. `stage` says how far publishing got:
+    "prediction" (no prediction posted), "partial_prediction" (some sub-questions
+    of a conditional posted), "comment" (prediction posted, comment not posted)
+    or "after_posting" (both posted, failed afterwards).
+    """
+
+    stage: str
+    post_id: int | None
+    question_id: int | None
+    url: str | None
+    title: str
+    error: str
+
+
+def print_failed_questions(failed: Sequence[FailedQuestion]) -> None:
+    """
+    One "FAILED_QUESTION ..." line per failed question, read by
+    .github/scripts/watch_bot.py. Keep the format in step with its parser:
+    the fields are space-separated key=value, and title comes last.
+    """
+    if not failed:
+        return
+    print("Failed questions:")
+    for f in failed:
+        title = " ".join(f.title.split())
+        print(
+            f"FAILED_QUESTION stage={f.stage} post_id={f.post_id} "
+            f"question_id={f.question_id} url={f.url} title={title}"
+        )
+        error = " ".join(f.error.split())
+        print(f"  error: {error[:300]}")
     print()
