@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+import sys
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -8,7 +9,9 @@ import dotenv
 
 # Runtime helpers (env validation, banners, dependency-warning suppression).
 from bot_helpers import (
+    FailedQuestion,
     check_environment,
+    print_failed_questions,
     print_run_summary_banner,
     print_startup_banner,
     silence_noisy_dependencies,
@@ -20,6 +23,7 @@ from forecasting_tools import (
     AskNewsSearcher,
     BinaryQuestion,
     ForecastBot,
+    ForecastReport,
     GeneralLlm,
     MetaculusClient,
     MetaculusQuestion,
@@ -125,6 +129,27 @@ class FallTemplateBot2026(ForecastBot):
     )
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
+
+    ##################################### FAILURE TRACKING #####################################
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.failed_questions: list[FailedQuestion] = []
+
+    async def _run_individual_question_with_error_propagation(
+        self, question: MetaculusQuestion
+    ) -> ForecastReport:
+        # Records which question failed and how far publishing got, then re-raises
+        # unchanged. Research, forecasting and aggregation are untouched.
+        try:
+            return await super()._run_individual_question_with_error_propagation(
+                question
+            )
+        except Exception as e:
+            self.failed_questions.append(
+                describe_failure(question, e, self.metaculus_client)
+            )
+            raise
 
     ##################################### RESEARCH #####################################
 
@@ -739,8 +764,67 @@ def make_anthropic_llms() -> dict[str, GeneralLlm]:
     }
 
 
+class PublishTrackingMetaculusClient(MetaculusClient):
+    """
+    A MetaculusClient that remembers which predictions and comments went through,
+    so a failed question can be reported as "prediction not posted" or
+    "prediction posted, comment not posted". Posting itself is unchanged.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.posted_prediction_question_ids: set[int] = set()
+        self.posted_comment_post_ids: set[int] = set()
+
+    def _post_question_prediction(
+        self, question_id: int, forecast_payload: dict
+    ) -> None:
+        super()._post_question_prediction(question_id, forecast_payload)
+        self.posted_prediction_question_ids.add(question_id)
+
+    def post_question_comment(
+        self, post_id: int, comment_text: str, *args, **kwargs
+    ) -> None:
+        super().post_question_comment(post_id, comment_text, *args, **kwargs)
+        self.posted_comment_post_ids.add(post_id)
+
+
+def describe_failure(
+    question: MetaculusQuestion, error: BaseException, client: MetaculusClient
+) -> FailedQuestion:
+    """
+    How far publishing got before `error`. A conditional question publishes its
+    yes and no sub-questions, so those are what get checked.
+    """
+    if isinstance(question, ConditionalQuestion):
+        published = [question.question_yes, question.question_no]
+    else:
+        published = [question]
+    posted_predictions = getattr(client, "posted_prediction_question_ids", set())
+    posted_comments = getattr(client, "posted_comment_post_ids", set())
+    prediction_posted = [q.id_of_question in posted_predictions for q in published]
+    comment_posted = [q.id_of_post in posted_comments for q in published]
+    if not any(prediction_posted):
+        stage = "prediction"
+    elif not all(prediction_posted):
+        stage = "partial_prediction"
+    elif not all(comment_posted):
+        stage = "comment"
+    else:
+        stage = "after_posting"
+    return FailedQuestion(
+        stage=stage,
+        post_id=question.id_of_post,
+        question_id=question.id_of_question,
+        url=question.page_url,
+        title=question.question_text,
+        error=f"{type(error).__name__}: {error}",
+    )
+
+
 def make_bot(publish_to_metaculus: bool) -> FallTemplateBot2026:
     return FallTemplateBot2026(
+        metaculus_client=PublishTrackingMetaculusClient(),
         research_reports_per_question=1,
         predictions_per_research_report=3,
         use_research_summary_to_forecast=False,
@@ -823,9 +907,14 @@ if __name__ == "__main__":
             )
         )
 
-    template_bot.log_report_summary(forecast_reports)
+    # raise_errors=False so the summary banner and the failed-question lines are
+    # always printed; the exit code below is what turns the run red.
+    template_bot.log_report_summary(forecast_reports, raise_errors=False)
     print_run_summary_banner(
         forecast_reports,
         will_publish=publish_to_metaculus,
         tournament_url=TOURNAMENT_URLS.get(run_mode),
     )
+    print_failed_questions(template_bot.failed_questions)
+    if any(isinstance(r, BaseException) for r in forecast_reports):
+        sys.exit(1)

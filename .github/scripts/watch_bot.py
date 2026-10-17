@@ -3,7 +3,8 @@ Daily watch report for the tournament bot (run by .github/workflows/watch_bot.ya
 
 Counts the last 24 hours of run_bot_on_tournament.yaml runs, reads each run's log
 for the per-question lines that ForecastBot.log_report_summary prints after
-"Bot: <name>" ("✅ URL: ..." / "❌ Exception: ..."), and posts a short Japanese
+"Bot: <name>" ("✅ URL: ..." / "❌ Exception: ...") and the "FAILED_QUESTION ..."
+lines that bot_helpers.print_failed_questions prints, and posts a short Japanese
 report as a comment on the issue titled REPORT_ISSUE_TITLE (created if missing).
 
 Standard library only, so the workflow needs no install step.
@@ -35,6 +36,28 @@ INACTIVITY_WARN_DAYS = 50
 JST = ZoneInfo("Asia/Tokyo")
 
 _TIMESTAMP_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z ")
+# Printed by bot_helpers.print_failed_questions; title comes last and may hold spaces.
+_FAILED_QUESTION = re.compile(
+    r"^FAILED_QUESTION stage=(?P<stage>\S+) post_id=(?P<post_id>\S+) "
+    r"question_id=(?P<question_id>\S+) url=(?P<url>\S+) title=(?P<title>.*)$"
+)
+# What each stage means, in the report's words.
+STAGE_LABELS = {
+    "prediction": "予測が出ていない",
+    "partial_prediction": "予測が一部しか出ていない",
+    "comment": "予測は出たが、コメントが出ていない",
+    "after_posting": "予測もコメントも出たあとで失敗した",
+}
+
+
+@dataclass
+class FailedQuestionLine:
+    stage: str
+    post_id: str
+    question_id: str
+    url: str
+    title: str
+    run_url: str = ""
 
 
 @dataclass
@@ -42,6 +65,7 @@ class LogCounts:
     succeeded: int = 0
     failed: int = 0
     no_new_questions: bool = False
+    failed_questions: list[FailedQuestionLine] = field(default_factory=list)
 
 
 @dataclass
@@ -76,6 +100,10 @@ def parse_log(text: str) -> LogCounts:
         line = _TIMESTAMP_PREFIX.sub("", raw).strip()
         if "No new questions to forecast" in line:
             counts.no_new_questions = True
+        match = _FAILED_QUESTION.match(line)
+        if match:
+            counts.failed_questions.append(FailedQuestionLine(**match.groupdict()))
+            continue
         if line.startswith("Bot: "):
             in_summary = True
             continue
@@ -99,7 +127,12 @@ def judge(snap: Snapshot) -> tuple[bool, list[str]]:
         problems.append(f"失敗した実行が {len(failed_runs)} 回あります")
     failed_questions = sum(r.log.failed for r in runs if r.log)
     if failed_questions:
-        problems.append(f"予測に失敗した問いが {failed_questions} 件あります")
+        problems.append(f"失敗した問いが {failed_questions} 件あります")
+    by_stage: dict[str, int] = {}
+    for f in (f for r in runs if r.log for f in r.log.failed_questions):
+        by_stage[f.stage] = by_stage.get(f.stage, 0) + 1
+    for stage, n in by_stage.items():
+        problems.append(f"{STAGE_LABELS.get(stage, stage)}問いが {n} 件")
     if snap.latest_run_at is None:
         problems.append("実行の記録が1件もありません（止まっている疑い）")
     elif snap.now - snap.latest_run_at > STALL_AFTER:
@@ -154,6 +187,20 @@ def render(snap: Snapshot) -> str:
         lines.append(f"- 最後の push から {idle_days} 日（{INACTIVITY_LIMIT_DAYS} 日で時刻の係が止まる恐れ）")
     if snap.log_errors:
         lines.append(f"- ログを読めなかった実行：{snap.log_errors} 回（問いの数に入っていません）")
+    failed_lines = [f for r in runs if r.log for f in r.log.failed_questions]
+    if failed_lines:
+        lines.append("")
+        lines.append("失敗した問い")
+        for f in failed_lines:
+            label = STAGE_LABELS.get(f.stage, f.stage)
+            lines.append(
+                f"- 【{label}】{f.title}（投稿 ID {f.post_id}・問い ID {f.question_id}）{f.url}　実行：{f.run_url}"
+            )
+    unexplained = q_ng - len(failed_lines)
+    if unexplained > 0:
+        lines.append(
+            f"- ほかに ❌ が {unexplained} 件あります。問いの ID と段階はログに出ていません（この仕組みより前の実行など）"
+        )
     for action in snap.enable_actions:
         lines.append(f"- {action}")
     return "\n".join(lines)
@@ -264,6 +311,9 @@ def collect(gh: GitHub, now: datetime) -> Snapshot:
                 counts.succeeded += part.succeeded
                 counts.failed += part.failed
                 counts.no_new_questions |= part.no_new_questions
+                for f in part.failed_questions:
+                    f.run_url = run.html_url
+                counts.failed_questions += part.failed_questions
             run.log = counts
         except Exception as e:  # a missing or expired log should not stop the report
             print(f"could not read log for run {run.id}: {e}", file=sys.stderr)
